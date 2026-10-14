@@ -12,7 +12,7 @@ from windows_mcp.vdm.core import (
 from windows_mcp.desktop.views import DesktopState, Window, Browser, Status, Size, Display
 from windows_mcp.tree.views import BoundingBox, TreeElementNode, TreeState, SemanticNode
 from PIL import ImageFont, ImageDraw, Image
-from windows_mcp.tree.service import Tree
+from windows_mcp.tree.service import Tree, _excluded_process_names, _window_process_name
 from windows_mcp.desktop import screenshot as screenshot_capture
 from windows_mcp.desktop.control import get_controller
 from windows_mcp.desktop import flash_overlay
@@ -40,6 +40,11 @@ import io
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+#: Returned by `Desktop._excluded_foreground_window` to mean "not an excluded process,
+#: take the UI Automation path". A plain None cannot say it: None is also the answer for
+#: an excluded window that fails the listing filters.
+_NOT_EXCLUDED = object()
 
 import windows_mcp.uia as uia  # noqa: E402
 
@@ -1092,6 +1097,37 @@ class Desktop:
             handles.add(secondary_taskbar_hwnd)
         return handles
 
+    def _excluded_foreground_window(self, windows: list[Window]) -> "Window | None | object":
+        """The foreground window, when its process must not be entered through UIA.
+
+        `get_foreground_window` resolves the top-level window with ControlFromHandle and
+        a UIA parent walk, which blocks against a wedged provider exactly like the
+        enumeration in `get_windows` does. For an excluded process the same two steps
+        are done with Win32: GetAncestor(GA_ROOT) replaces the parent walk.
+
+        Args:
+            windows: Windows already enumerated, searched by handle first.
+
+        Returns:
+            `_NOT_EXCLUDED` when the foreground process is not excluded and the caller
+            should take the UIA path; otherwise the window, or None when it fails the
+            filters `get_windows` applies.
+        """
+        excluded_processes = _excluded_process_names()
+        if not excluded_processes:
+            return _NOT_EXCLUDED
+        handle = uia.GetForegroundWindow()
+        if not handle:
+            return _NOT_EXCLUDED
+        process_name = _window_process_name(handle)
+        if not process_name or process_name.casefold() not in excluded_processes:
+            return _NOT_EXCLUDED
+        root_handle = win32gui.GetAncestor(handle, win32con.GA_ROOT) or handle
+        for window in windows:
+            if window.handle == root_handle:
+                return window
+        return self._win32_window(root_handle, 0, process_name)
+
     # Tuned retry envelope for transient UIA empty results. The OS
     # briefly returns NULL from GetForegroundWindow during focus
     # transitions, app launches, and notification overlays — three
@@ -1114,6 +1150,9 @@ class Desktop:
             try:
                 if windows is None:
                     windows, _ = self.get_windows()
+                excluded = self._excluded_foreground_window(windows)
+                if excluded is not _NOT_EXCLUDED:
+                    return excluded
                 active_window = self.get_foreground_window()
                 if active_window is None:
                     # NULL foreground — retry, this often clears on the
@@ -1177,6 +1216,96 @@ class Desktop:
                 return current
             current = parent
 
+    def _win32_window_status(self, handle: int) -> Status:
+        """Window status from Win32 only, for a handle UI Automation must not touch.
+
+        Same three probes `get_window_status` uses — they already take a handle and
+        never enter the window's accessibility provider.
+        """
+        if uia.IsIconic(handle):
+            return Status.MINIMIZED
+        if uia.IsZoomed(handle):
+            return Status.MAXIMIZED
+        if uia.IsWindowVisible(handle):
+            return Status.NORMAL
+        return Status.HIDDEN
+
+    def _win32_window(self, handle: int, depth: int, process_name: str | None) -> Window | None:
+        """Describe a window without a single UI Automation call.
+
+        Used for the processes in ``WINDOWS_MCP_EXCLUDE_PROCESSES``: dropping them from
+        the listing outright would cost the caller the ability to even see or switch to
+        those windows, so they are described through Win32, which cannot block on the
+        target's accessibility provider.
+
+        Each filter mirrors the UI Automation one in `get_windows`, with the Win32
+        equivalent checked against it on this platform across every visible window:
+        ``WS_MINIMIZEBOX | WS_MAXIMIZEBOX`` agreed with
+        ``WindowPattern.CanMinimize and CanMaximize`` on all of them, and
+        ``GetWindowRect`` agreed with ``BoundingRectangle`` exactly on every window
+        except a minimized one, where Win32 reports the off-screen (-32000, -32000)
+        placeholder and UI Automation reports an empty rect — so that case is
+        normalized to empty, which is what `get_windows` already stores.
+
+        Args:
+            handle: Native window handle.
+            depth: Z-order index, as `get_windows` assigns it.
+            process_name: Executable basename owning the handle, or None.
+
+        Returns:
+            The window, or None when it fails a filter `get_windows` also applies.
+        """
+        try:
+            name = win32gui.GetWindowText(handle)
+            style = win32gui.GetWindowLong(handle, win32con.GWL_STYLE)
+        except Exception:
+            return None
+
+        # Mirrors is_overlay_window. Its "no title AND no children" test needs UIA for
+        # the children half, so a blank title alone decides here — the same signal that
+        # function calls mandatory, since a real app window always has a title.
+        if "Overlay" in name or not name.strip():
+            return None
+
+        # Stands in for the WindowPattern.CanMinimize/CanMaximize gate below, which is
+        # what separates an app window from a tooltip, panel or shell surface.
+        if not (style & win32con.WS_MINIMIZEBOX and style & win32con.WS_MAXIMIZEBOX):
+            return None
+
+        status = self._win32_window_status(handle)
+        if status == Status.MINIMIZED:
+            left = top = right = bottom = 0
+        else:
+            try:
+                left, top, right, bottom = win32gui.GetWindowRect(handle)
+            except Exception:
+                return None
+            if right <= left or bottom <= top:
+                # Empty and not minimized — get_windows skips these too.
+                return None
+
+        try:
+            _, process_id = win32process.GetWindowThreadProcessId(handle)
+        except Exception:
+            process_id = 0
+
+        return Window(
+            name=name,
+            depth=depth,
+            status=status,
+            bounding_box=BoundingBox(
+                left=left,
+                top=top,
+                right=right,
+                bottom=bottom,
+                width=right - left,
+                height=bottom - top,
+            ),
+            handle=handle,
+            process_id=process_id,
+            is_browser=bool(process_name) and Browser.has_process(process_name),
+        )
+
     def get_windows(
         self, controls_handles: set[int] | None = None
     ) -> tuple[list[Window], set[int]]:
@@ -1184,7 +1313,21 @@ class Desktop:
             windows = []
             window_handles = set()
             controls_handles = controls_handles or self.get_controls_handles()
+            excluded_processes = _excluded_process_names()
             for depth, hwnd in enumerate(controls_handles):
+                if excluded_processes:
+                    # The tree walk already refuses to enter these providers, but this
+                    # pre-pass ran before any walk and called straight into them: a
+                    # wedged provider blocked ControlFromHandle here for 15.4s with the
+                    # exclusion set, because the exclusion was only honoured downstream.
+                    # Resolve the owner through Win32/psutil, never UIA.
+                    process_name = _window_process_name(hwnd)
+                    if process_name and process_name.casefold() in excluded_processes:
+                        window = self._win32_window(hwnd, depth, process_name)
+                        if window is not None:
+                            windows.append(window)
+                            window_handles.add(window.handle)
+                        continue
                 try:
                     child = uia.ControlFromHandle(hwnd)
                 except Exception:
