@@ -77,6 +77,10 @@ class DesktopState:
     available_displays: list[Display] | None = None
     screenshot_backend: str | None = None
     tree_state: TreeState | None = None
+    #: Whether the window pre-pass was abandoned mid-call because an application stopped
+    #: answering UI Automation. The window list is then unknown, not empty, and saying
+    #: "no windows found" would assert something false about the desktop.
+    windows_abandoned: bool = False
     capture_sec: float = 0.0
 
     def active_desktop_to_string(self):
@@ -89,14 +93,27 @@ class DesktopState:
         rows = [[desktop.get("name")] for desktop in self.all_desktops]
         return tabulate(rows, headers=headers, tablefmt="simple")
 
+    #: Said instead of "no windows found" when the pre-pass was abandoned. It names the
+    #: cause and the one setting that keeps the scan out of the offending process, the
+    #: same guidance an abandoned tree capture gives.
+    _WINDOWS_ABANDONED_NOTE = (
+        "Window list unavailable: an application stopped answering UI Automation and the "
+        "window scan was abandoned. This is not an empty desktop. Retry, or keep the scan "
+        "out of that process with WINDOWS_MCP_EXCLUDE_PROCESSES."
+    )
+
     def active_window_to_string(self):
         if not self.active_window:
+            if self.windows_abandoned:
+                return "Active window unavailable: the window scan was abandoned — see Windows."
             return "No active window found"
         headers = ["Name", "Depth", "Status", "Width", "Height", "Handle"]
         return tabulate([self.active_window.to_row()], headers=headers, tablefmt="simple")
 
     def windows_to_string(self):
         if not self.windows:
+            if self.windows_abandoned:
+                return self._WINDOWS_ABANDONED_NOTE
             return "No windows found"
         headers = ["Name", "Depth", "Status", "Width", "Height", "Handle"]
         rows = [window.to_row() for window in self.windows]

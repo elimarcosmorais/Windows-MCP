@@ -12,7 +12,13 @@ from windows_mcp.vdm.core import (
 from windows_mcp.desktop.views import DesktopState, Window, Browser, Status, Size, Display
 from windows_mcp.tree.views import BoundingBox, TreeElementNode, TreeState, SemanticNode
 from PIL import ImageFont, ImageDraw, Image
+from windows_mcp.tree.budget import (
+    TRUNCATION_REASON_ABANDONED,
+    resolve_max_tree_elements,
+    resolve_tree_timeout,
+)
 from windows_mcp.tree.service import Tree, _excluded_process_names, _window_process_name
+from windows_mcp.tree.worker import run_capture
 from windows_mcp.desktop import screenshot as screenshot_capture
 from windows_mcp.desktop.control import get_controller
 from windows_mcp.desktop import flash_overlay
@@ -142,10 +148,29 @@ class Desktop:
         # Fast path for Screenshot tool (use_ui_tree=False): skip window enumeration.
         # UIAutomation calls (get_controls_handles / get_windows / get_active_window)
         # can hang when an app is launching and not responding to WM messages.
+        probe_timeout = 0.0
+        probe_abandoned = False
         if use_ui_tree:
-            controls_handles = self.get_controls_handles()  # Taskbar,Program Manager,Apps, Dialogs
-            windows, windows_handles = self.get_windows(controls_handles=controls_handles)  # Apps
-            active_window = self.get_active_window(windows=windows)  # Active Window
+            probe_timeout = resolve_tree_timeout()
+            probe, probe_abandoned = run_capture(
+                self._probe_window_context,
+                probe_timeout,
+                thread_name="windows-mcp-window-probe",
+                label="Desktop",
+            )
+            if probe_abandoned:
+                logger.warning(
+                    "[Desktop] Window pre-pass abandoned after %.1fs — an application stopped "
+                    "answering UI Automation before the walk even started. Returning without a "
+                    "window list; the pre-pass thread is left running and is not reused.",
+                    probe_timeout,
+                )
+                controls_handles = set()
+                windows = []
+                windows_handles = set()
+                active_window = None
+            else:
+                controls_handles, windows, windows_handles, active_window = probe
             active_window_handle = active_window.handle if active_window else None
         else:
             controls_handles = set()
@@ -176,7 +201,19 @@ class Desktop:
         logger.debug(f"Active window: {active_window or 'No Active Window Found'}")
         logger.debug(f"Windows: {windows}")
 
-        if use_ui_tree:
+        if probe_abandoned:
+            # Walking now would mean entering the same provider that just swallowed the
+            # pre-pass: another hard timeout, another abandoned thread, and nothing to
+            # show for either. Report the capture as abandoned instead.
+            tree_state = TreeState(
+                status=False,
+                truncated=True,
+                truncation_reason=TRUNCATION_REASON_ABANDONED,
+                timeout_sec=probe_timeout,
+                element_limit=resolve_max_tree_elements(),
+                capture_sec=probe_timeout,
+            )
+        elif use_ui_tree:
             other_windows_handles = set(controls_handles - windows_handles)
             if active_window_handle is not None:
                 other_windows_handles.discard(active_window_handle)
@@ -291,6 +328,7 @@ class Desktop:
             screenshot_displays=display_indices,
             available_displays=available_displays,
             tree_state=tree_state,
+            windows_abandoned=probe_abandoned,
             screenshot_backend=getattr(self, "_last_screenshot_backend", None)
             if use_vision
             else None,
@@ -1215,6 +1253,28 @@ class Desktop:
             if parent is None or parent.NativeWindowHandle == root_handle:
                 return current
             current = parent
+
+    def _probe_window_context(self) -> tuple[set[int], list[Window], set[int], Window | None]:
+        """Enumerate the windows a capture needs, before any tree walk.
+
+        Every step here crosses into another process: `get_controls_handles` asks the
+        shell which windows are on the current virtual desktop, and the other two read
+        window properties through UI Automation. A provider that stops answering blocks
+        the first UIA call it is given — measured at 15.4s inside ControlFromHandle —
+        and neither the walk deadline nor the capture ceiling reaches this far, because
+        both cover `Tree.get_state`, which has not been called yet.
+
+        So this runs through `run_capture`, on a thread the caller can stop waiting for.
+        Everything it returns is plain data: Window is a dataclass and the handles are
+        ints, so nothing built in the worker's apartment escapes into the caller's.
+
+        Returns:
+            ``(controls_handles, windows, windows_handles, active_window)``.
+        """
+        controls_handles = self.get_controls_handles()  # Taskbar,Program Manager,Apps, Dialogs
+        windows, windows_handles = self.get_windows(controls_handles=controls_handles)  # Apps
+        active_window = self.get_active_window(windows=windows)  # Active Window
+        return controls_handles, windows, windows_handles, active_window
 
     def _win32_window_status(self, handle: int) -> Status:
         """Window status from Win32 only, for a handle UI Automation must not touch.

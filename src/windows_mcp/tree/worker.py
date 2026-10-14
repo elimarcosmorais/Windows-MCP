@@ -1,4 +1,9 @@
-"""Runs a tree capture on a worker thread, so one wedged COM call cannot pin the server.
+"""Runs a capture on a worker thread, so one wedged COM call cannot pin the server.
+
+Used by the tree walk and by Snapshot's window pre-pass (`Desktop._probe_window_context`),
+which reaches into other processes' providers before any walk starts and so can wedge the
+same way. Both share the abandonment cap below, which counts threads stuck in COM
+regardless of which stage leaked them.
 
 TreeWalkDeadline bounds a walk *between* UI Automation calls, which is where a merely
 slow provider can be stopped. It cannot bound a provider that stops answering *inside*
@@ -97,6 +102,7 @@ def run_capture(
     timeout_sec: float,
     *,
     thread_name: str = "windows-mcp-tree-capture",
+    label: str = "Tree",
 ) -> tuple[T | None, bool]:
     """Run `capture` on a worker thread with its own COM apartment.
 
@@ -106,6 +112,10 @@ def run_capture(
         timeout_sec: How long to wait before abandoning the thread.
         thread_name: Name for the worker thread, to make a wedged one identifiable in a
             stack dump.
+        label: Log prefix naming the stage being run, since the tree walk is not the
+            only stage that calls into another process's provider — Snapshot's window
+            pre-pass does too, and shares the abandonment cap below, which counts
+            threads stuck in COM regardless of which stage leaked them.
 
     Returns:
         ``(value, abandoned)``. On success, the capture's return value and False. On
@@ -120,8 +130,9 @@ def run_capture(
     stuck = abandoned_capture_count()
     if stuck >= MAX_ABANDONED_CAPTURES:
         logger.warning(
-            "[Tree] %d abandoned capture thread(s) still blocked in COM — skipping this "
+            "[%s] %d abandoned capture thread(s) still blocked in COM — skipping this "
             "capture instead of leaking another. Captures resume once they unblock.",
+            label,
             stuck,
         )
         return None, True
@@ -140,7 +151,7 @@ def run_capture(
         except Exception as exc:  # pragma: no cover - platform specific
             # Worth capturing: the capture may still work (COM already initialized for
             # this thread by something else), so this is not a reason to bail out.
-            logger.debug("[Tree] CoInitializeEx failed on capture thread: %s", exc)
+            logger.debug("[%s] CoInitializeEx failed on capture thread: %s", label, exc)
         try:
             box["value"] = capture()
         except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread
@@ -150,7 +161,7 @@ def run_capture(
                 try:
                     comtypes.CoUninitialize()
                 except Exception as exc:  # pragma: no cover - platform specific
-                    logger.debug("[Tree] CoUninitialize failed on capture thread: %s", exc)
+                    logger.debug("[%s] CoUninitialize failed on capture thread: %s", label, exc)
 
     thread = threading.Thread(target=worker, name=thread_name, daemon=True)
     thread.start()
