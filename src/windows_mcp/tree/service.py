@@ -7,7 +7,15 @@ from windows_mcp.tree.cache_utils import (
     CachedControlHelper,
     is_uia_dead_element_error,
 )
-from windows_mcp.tree.budget import TreeElementBudget, resolve_max_tree_elements
+from windows_mcp.tree.budget import (
+    TRUNCATION_REASON_BOTH,
+    TRUNCATION_REASON_ELEMENTS,
+    TRUNCATION_REASON_TIME,
+    TreeElementBudget,
+    TreeWalkDeadline,
+    resolve_max_tree_elements,
+    resolve_tree_timeout,
+)
 from windows_mcp.tree.utils import random_point_within_bounding_box
 from windows_mcp.tree import ia2 as ia2_traversal
 from typing import TYPE_CHECKING,Optional,Any
@@ -108,6 +116,7 @@ class Tree:
         self.screen_box=desktop.get_screen_box()
         self.tree_state=None
         self.element_budget=TreeElementBudget(resolve_max_tree_elements())
+        self.walk_deadline=TreeWalkDeadline(resolve_tree_timeout())
 
 
     def get_state(self,active_window_handle:int|None,other_windows_handles:list[int],use_dom:bool=False)->TreeState:
@@ -118,6 +127,10 @@ class Tree:
         # Fresh budget per capture — huge lists/grids (e.g. thousands of rows) must not
         # stall UI Automation or blow up the serialized response.
         self.element_budget = TreeElementBudget(resolve_max_tree_elements())
+        # Fresh deadline per capture too, for what an element count cannot bound: a slow
+        # provider stretches a capture that stays inside the element budget, and a subtree
+        # that appends no output nodes spends no budget at all while it is walked.
+        self.walk_deadline = TreeWalkDeadline(resolve_tree_timeout())
         start_time = perf_counter()
         profile_enabled = _snapshot_profile_enabled()
 
@@ -189,12 +202,20 @@ class Tree:
         if not status:
             logger.warning(f"[Tree] {len(failed_handles)} window(s) failed to capture — UI services may be loading")
         end_time = perf_counter()
-        if self.element_budget.truncated:
+        truncation_reason = self._truncation_reason()
+        if truncation_reason in (TRUNCATION_REASON_ELEMENTS, TRUNCATION_REASON_BOTH):
             logger.warning(
                 "[Tree] Capture truncated at %d elements (limit=%d) — some UI elements were "
                 "not visited. Set WINDOWS_MCP_MAX_TREE_ELEMENTS to raise the limit.",
                 self.element_budget.count,
                 self.element_budget.limit,
+            )
+        if truncation_reason in (TRUNCATION_REASON_TIME, TRUNCATION_REASON_BOTH):
+            logger.warning(
+                "[Tree] Capture truncated after %.1fs (limit=%.1fs) — some UI elements were "
+                "not visited. Set WINDOWS_MCP_TREE_TIMEOUT to raise the limit.",
+                self.walk_deadline.elapsed_sec,
+                self.walk_deadline.limit_sec,
             )
         if profile_enabled:
             logger.info(
@@ -207,7 +228,7 @@ class Tree:
                 len(failed_handles),
                 (end_time - start_time) * 1000,
                 use_dom,
-                self.element_budget.truncated,
+                truncation_reason or False,
             )
         logger.info(f"[Tree] Tree State capture took {end_time - start_time:.2f} seconds")
         return TreeState(
@@ -219,9 +240,28 @@ class Tree:
             dom_informative_nodes=dom_informative_nodes,
             capture_sec=end_time - start_time,
             semantic_tree_root=desktop_root,
-            truncated=self.element_budget.truncated,
+            truncated=bool(truncation_reason),
             element_limit=self.element_budget.limit,
+            truncation_reason=truncation_reason,
+            timeout_sec=self.walk_deadline.limit_sec,
         )
+
+    def _truncation_reason(self)->str:
+        """Name which limit stopped the capture, for the log and the state view.
+
+        Returns:
+            ``"elements"``, ``"time"``, ``"elements+time"``, or ``""`` when the
+            capture ran to completion.
+        """
+        out_of_elements=self.element_budget.truncated
+        out_of_time=self.walk_deadline.expired
+        if out_of_elements and out_of_time:
+            return TRUNCATION_REASON_BOTH
+        if out_of_time:
+            return TRUNCATION_REASON_TIME
+        if out_of_elements:
+            return TRUNCATION_REASON_ELEMENTS
+        return ""
 
     def get_window_wise_nodes(self,windows_handles:list[int],active_window_flag:bool,use_dom:bool=False) -> tuple[list[TreeElementNode],list[ScrollElementNode],list[TextElementNode],list[int],list[SemanticNode]]:
         """Process windows sequentially to avoid COM apartment threading deadlock.
@@ -270,6 +310,13 @@ class Tree:
                     "[Tree] Element budget exhausted (%d/%d) — skipping remaining windows",
                     self.element_budget.count,
                     self.element_budget.limit,
+                )
+                break
+            if self.walk_deadline.expired:
+                logger.debug(
+                    "[Tree] Walk deadline expired (%.1fs/%.1fs) — skipping remaining windows",
+                    self.walk_deadline.elapsed_sec,
+                    self.walk_deadline.limit_sec,
                 )
                 break
             for attempt in range(THREAD_MAX_RETRIES + 1):
@@ -321,7 +368,7 @@ class Tree:
                             target_nodes:list[TreeElementNode], current_semantic_node:'Optional[SemanticNode]'=None):
         """Append one interactive `TreeElementNode` (control_type='Word') per (word, rect) pair."""
         for word, rect in word_elements:
-            if not self.element_budget.try_consume():
+            if self.walk_deadline.expired or not self.element_budget.try_consume():
                 break
             bounding_box = self.iou_bounding_box(reference_box, rect)
             if bounding_box.width <= 0 or bounding_box.height <= 0:
@@ -450,6 +497,11 @@ class Tree:
                     element_cache_req:Optional[Any]=None, children_cache_req:Optional[Any]=None,
                     current_semantic_node:'Optional[SemanticNode]'=None,
                     ancestor_runtime_ids:Optional[frozenset[tuple[int, ...]]]=None):
+        # Checked on entry as well as before descending: the property reads below are
+        # cross-process calls into the target's provider, and a capture that has already
+        # run out of time must not pay for one more node's worth of them.
+        if self.walk_deadline.expired:
+            return
         try:
             # Build cached control if caching is enabled
             if not hasattr(node, '_is_cached') and element_cache_req:
@@ -843,10 +895,12 @@ class Tree:
 
             # Recursively traverse the tree the right to left for normal apps and for DOM traverse from left to right
             for child in (children if is_dom else reversed(children)):
-                if self.element_budget.exhausted:
+                if self.element_budget.exhausted or self.walk_deadline.expired:
                     # Stop descending once the element budget is spent — this is what
                     # bounds traversal time on huge flat lists/grids (thousands of rows),
-                    # not just the size of the appended node lists.
+                    # not just the size of the appended node lists. The deadline covers
+                    # what a count cannot: slow providers, and subtrees that recurse
+                    # without appending the nodes that would spend the budget.
                     break
                 try:
                     # Check if the child is a DOM element
@@ -969,12 +1023,14 @@ class Tree:
                         hwnd=handle,
                         window_name=window_name,
                         window_bounding_box=window_box,
+                        deadline=self.walk_deadline,
                     )
                     ia2_ms = (perf_counter() - ia2_t0) * 1000
                     if ia2_result:
-                        # traverse_window() already walked the whole IAccessible tree before
-                        # returning, so this can't bound traversal time — but it still caps
-                        # how much of the result gets appended/serialized.
+                        # traverse_window() walks the IAccessible tree before returning, so
+                        # the element budget here only caps how much of the result gets
+                        # appended/serialized — bounding that walk's time is the shared
+                        # walk_deadline's job, which the walk now checks as it descends.
                         remaining = self.element_budget.remaining
                         capped_interactive = ia2_result.interactive_nodes[:remaining]
                         remaining_after_interactive = max(0, remaining - len(capped_interactive))

@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from windows_mcp.tree.budget import TRUNCATION_REASON_BOTH, TRUNCATION_REASON_TIME
+
 
 _ACTION_MAP: dict[str, str] = {
     "edit": "fill",
@@ -86,11 +88,43 @@ def _render_tree(nodes: list, meta_fn) -> str:
     return "\n".join(lines).rstrip()
 
 
-def _truncation_note(element_limit: int) -> str:
+_NARROW_HINT = (
+    "some elements were not visited. Narrow the view (filter by window, scroll to "
+    "the area of interest, use_dom=True for a browser page) or raise "
+)
+
+
+def _truncation_note(
+    element_limit: int,
+    truncation_reason: str = "",
+    timeout_sec: float = 0.0,
+) -> str:
+    """Render the note appended to a partial capture.
+
+    Args:
+        element_limit: Element budget the capture ran under.
+        truncation_reason: ``"time"``, ``"elements+time"``, or anything else for
+            the element-limit wording (the default, so a state built without a
+            reason keeps the original note).
+        timeout_sec: Wall-clock budget the capture ran under, in seconds.
+
+    Returns:
+        A note naming which limit stopped the capture and the setting that raises it.
+    """
+    elements = f"reached the {element_limit}-element capture limit"
+    timing = f"hit the {timeout_sec:g}s capture time limit"
+    if truncation_reason == TRUNCATION_REASON_BOTH:
+        return (
+            f"... [truncated: {elements} and {timing} — {_NARROW_HINT}"
+            "WINDOWS_MCP_MAX_TREE_ELEMENTS / WINDOWS_MCP_TREE_TIMEOUT for a complete tree.]"
+        )
+    if truncation_reason == TRUNCATION_REASON_TIME:
+        return (
+            f"... [truncated: {timing} — {_NARROW_HINT}"
+            "WINDOWS_MCP_TREE_TIMEOUT for a complete tree.]"
+        )
     return (
-        f"... [truncated: reached the {element_limit}-element capture limit — "
-        "some elements were not visited. Narrow the view (filter by window, scroll to "
-        "the area of interest, use_dom=True for a browser page) or raise "
+        f"... [truncated: {elements} — {_NARROW_HINT}"
         "WINDOWS_MCP_MAX_TREE_ELEMENTS for a complete tree.]"
     )
 
@@ -181,6 +215,11 @@ class TreeState:
     semantic_tree_root: "SemanticNode | None" = None
     truncated: bool = False
     element_limit: int = 0
+    truncation_reason: str = ""
+    timeout_sec: float = 0.0
+
+    def _truncation_note(self) -> str:
+        return _truncation_note(self.element_limit, self.truncation_reason, self.timeout_sec)
 
     def semantic_tree_to_string(self) -> str:
         if not self.semantic_tree_root:
@@ -189,7 +228,7 @@ class TreeState:
         _render_semantic_node(self.semantic_tree_root, lines, "", is_last=True)
         text = "\n".join(lines)
         if self.truncated:
-            text += "\n\n" + _truncation_note(self.element_limit)
+            text += "\n\n" + self._truncation_note()
         return text
 
     def interactive_elements_to_string(self) -> str:
@@ -197,7 +236,7 @@ class TreeState:
             return "No interactive elements"
         text = _render_tree(self.interactive_nodes, _node_meta_str)
         if self.truncated:
-            text += "\n\n" + _truncation_note(self.element_limit)
+            text += "\n\n" + self._truncation_note()
         return text
 
     def scrollable_elements_to_string(self) -> str:
@@ -205,7 +244,7 @@ class TreeState:
             return "No scrollable elements"
         text = _render_tree(self.scrollable_nodes, _scroll_meta_str)
         if self.truncated:
-            text += "\n\n" + _truncation_note(self.element_limit)
+            text += "\n\n" + self._truncation_note()
         return text
 
 

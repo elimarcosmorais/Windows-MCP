@@ -27,6 +27,7 @@ from enum import Enum
 from typing import Any, NoReturn
 import logging
 import asyncio
+import math
 import shlex
 import secrets
 import subprocess
@@ -138,6 +139,17 @@ def _control_timeout_option(ctx, param, value):
         return validate_idle_timeout(value)
     except ValueError as exc:
         raise click.BadParameter(str(exc), ctx=ctx, param=param) from exc
+
+
+def _tree_timeout_option(ctx, param, value):
+    """Reject a non-positive or non-finite --tree-timeout before the server starts."""
+    if value is None:
+        return None
+    if not math.isfinite(value) or value <= 0:
+        raise click.BadParameter(
+            "must be a positive finite number of seconds", ctx=ctx, param=param
+        )
+    return value
 
 
 class OptionsMiddleware:
@@ -412,6 +424,7 @@ _LEGACY_SERVE_FLAGS = {
     "--control",
     "--no-control",
     "--control-idle-timeout",
+    "--tree-timeout",
 }
 
 
@@ -687,6 +700,18 @@ def main():
     callback=_control_timeout_option,
     help="Positive finite user idle wait in seconds before control resumes. Restart required.",
 )
+@click.option(
+    "--tree-timeout",
+    type=float,
+    default=None,
+    show_default=False,
+    callback=_tree_timeout_option,
+    help=(
+        "Wall-clock budget in seconds for a single Snapshot/WaitFor tree capture. Past it the "
+        "capture stops and returns a partial tree marked as truncated. Overrides "
+        "WINDOWS_MCP_TREE_TIMEOUT (default 10)."
+    ),
+)
 def serve(
     ctx,
     transport,
@@ -707,10 +732,16 @@ def serve(
     stateless_http,
     control,
     control_idle_timeout,
+    tree_timeout,
 ):
     global _control_config
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     install_selfpipe_guard()
+    if tree_timeout is not None:
+        # The Tree reads its wall-clock budget from the environment on every capture
+        # (like WINDOWS_MCP_MAX_TREE_ELEMENTS), so the flag publishes itself there
+        # rather than threading a second config object through Desktop and Tree.
+        os.environ["WINDOWS_MCP_TREE_TIMEOUT"] = repr(tree_timeout)
     if transport == Transport.STDIO.value:
         os.environ.setdefault("NO_COLOR", "1")
     if debug:

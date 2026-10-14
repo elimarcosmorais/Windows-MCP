@@ -665,6 +665,8 @@ All variables are optional unless noted. Set them via the `env` key in `claude_d
 | `WINDOWS_MCP_SCREENSHOT_SCALE` | `1.0` | Scale factor applied to screenshots before encoding. Accepts a float in the range `0.1`–`1.0`. Useful on high-resolution displays (1440p, 4K) where the default produces images that exceed Claude Desktop's 1 MB tool-result limit. Set to `0.5` to halve both dimensions (quarter the file size). |
 | `WINDOWS_MCP_SCREENSHOT_BACKEND` | `auto` | Screenshot capture backend. Accepted values: `auto` (tries dxcam → mss → pillow in order), `dxcam`, `mss`, `pillow`. Use `mss` or `pillow` if `dxcam` is unavailable or causes issues on your GPU. |
 | `WINDOWS_MCP_PROFILE_SNAPSHOT` | _(disabled)_ | Set to `1`, `true`, `yes`, or `on` to emit per-stage timing logs for Screenshot/Snapshot calls. Useful for diagnosing slow captures. |
+| `WINDOWS_MCP_TREE_TIMEOUT` | `10` | Wall-clock budget in seconds for a single `Snapshot`/`WaitFor` tree capture. Past it the capture stops descending and returns a partial tree marked as truncated, naming the time limit. Accepts a positive finite number; an unset, blank, or unusable value falls back to the default. Equivalent to the `--tree-timeout` flag, which takes precedence. |
+| `WINDOWS_MCP_MAX_TREE_ELEMENTS` | `500` | Maximum UI elements a single `Snapshot`/`WaitFor` tree capture may collect before it stops descending and returns a partial tree marked as truncated. Bounds response size on huge flat lists/grids (e.g. an unfiltered inventory view with thousands of rows). An element count cannot bound capture *time* — `WINDOWS_MCP_TREE_TIMEOUT` does that. |
 | `WINDOWS_MCP_DISABLE_FLASH` | _(disabled)_ | Set to `1`, `true`, `yes`, or `on` to suppress the orange-red glowing border that briefly highlights the captured area after every screenshot. The flash is rendered on a transparent always-on-top window *after* capture so it never appears in the captured image. |
 
 ### Excluding processes from UI Automation traversal
@@ -685,7 +687,7 @@ Process names are comma-separated executable basenames. They are matched case-in
 
 A window is excluded *before* any UI Automation call is made against it, so its accessibility provider is never entered. Excluded applications may still appear in the window list, but Windows-MCP will not traverse their accessibility trees, and they are not reported as failed captures. If the owning process of a window cannot be resolved, the window is traversed as usual.
 
-This is an exclusion mechanism — a mitigation, not a complete fix for every form of [#383](https://github.com/CursorTouch/Windows-MCP/issues/383). It only skips the processes you name; a pathological window you have not listed can still stall a capture.
+This is an exclusion mechanism — a mitigation, not a complete fix for every form of [#383](https://github.com/CursorTouch/Windows-MCP/issues/383). It only skips the processes you name; a pathological window you have not listed can still slow a capture down, though `WINDOWS_MCP_TREE_TIMEOUT` bounds how long that costs you: the capture stops at the deadline and returns the partial tree it has, instead of waiting for the provider.
 
 ### Desktop control settings
 

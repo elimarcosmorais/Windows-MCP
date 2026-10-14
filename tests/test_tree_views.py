@@ -195,3 +195,68 @@ class TestTreeElementNode:
         assert target.metadata["has_focused"] is True
         assert target.bounding_box is sample_tree_element_node.bounding_box
         assert target.center is sample_tree_element_node.center
+
+
+class TestTruncationReasonNote:
+    """The note must name which limit stopped the capture, and which knob raises it."""
+
+    def test_time_reason_names_the_time_limit(self, sample_tree_element_node: TreeElementNode):
+        ts = TreeState(
+            interactive_nodes=[sample_tree_element_node],
+            truncated=True,
+            element_limit=500,
+            truncation_reason="time",
+            timeout_sec=10.0,
+        )
+        result = ts.interactive_elements_to_string()
+        assert "10s capture time limit" in result
+        assert "WINDOWS_MCP_TREE_TIMEOUT" in result
+        assert "element capture limit" not in result
+
+    def test_elements_reason_keeps_the_original_note(
+        self, sample_tree_element_node: TreeElementNode
+    ):
+        ts = TreeState(
+            interactive_nodes=[sample_tree_element_node],
+            truncated=True,
+            element_limit=500,
+            truncation_reason="elements",
+        )
+        result = ts.interactive_elements_to_string()
+        assert "500-element capture limit" in result
+        assert "WINDOWS_MCP_MAX_TREE_ELEMENTS" in result
+        assert "time limit" not in result
+
+    def test_both_reasons_name_both_limits(self, sample_tree_element_node: TreeElementNode):
+        ts = TreeState(
+            interactive_nodes=[sample_tree_element_node],
+            truncated=True,
+            element_limit=500,
+            truncation_reason="elements+time",
+            timeout_sec=2.5,
+        )
+        result = ts.interactive_elements_to_string()
+        assert "500-element capture limit" in result
+        assert "2.5s capture time limit" in result
+        assert "WINDOWS_MCP_MAX_TREE_ELEMENTS / WINDOWS_MCP_TREE_TIMEOUT" in result
+
+    def test_missing_reason_keeps_the_element_note(
+        self, sample_tree_element_node: TreeElementNode
+    ):
+        """A state built without a reason (older callers) must read as it did before."""
+        ts = TreeState(
+            interactive_nodes=[sample_tree_element_node], truncated=True, element_limit=500
+        )
+        assert "500-element capture limit" in ts.interactive_elements_to_string()
+
+    def test_time_reason_on_semantic_and_scrollable_views(
+        self, sample_scroll_element_node: ScrollElementNode
+    ):
+        ts = TreeState(
+            scrollable_nodes=[sample_scroll_element_node],
+            truncated=True,
+            element_limit=500,
+            truncation_reason="time",
+            timeout_sec=4.0,
+        )
+        assert "4s capture time limit" in ts.scrollable_elements_to_string()

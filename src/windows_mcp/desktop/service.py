@@ -1642,4 +1642,6 @@ class Desktop:
             semantic_tree_root=filtered_semantic_root,
             truncated=tree_state.truncated,
             element_limit=tree_state.element_limit,
+            truncation_reason=tree_state.truncation_reason,
+            timeout_sec=tree_state.timeout_sec,
         )

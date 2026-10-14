@@ -4,7 +4,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from windows_mcp.desktop.views import Size
-from windows_mcp.tree.budget import TreeElementBudget
+from windows_mcp.tree.budget import TreeElementBudget, TreeWalkDeadline
 from windows_mcp.tree.config import THREAD_MAX_RETRIES
 from windows_mcp.tree.service import (
     Tree,
@@ -12,7 +12,9 @@ from windows_mcp.tree.service import (
     _is_comtypes_variant_ord_typeerror,
     _window_process_name,
 )
-from windows_mcp.tree.views import BoundingBox, SemanticNode
+from windows_mcp.tree.views import BoundingBox, SemanticNode, TreeElementNode
+
+from tests.test_tree_budget import FakeClock
 from windows_mcp.uia import PropertyId, Rect
 
 
@@ -32,6 +34,18 @@ def make_box(left: int, top: int, right: int, bottom: int):
         bottom=bottom,
         width=right - left,
         height=bottom - top,
+    )
+
+
+def _make_tree_element_node(name: str) -> TreeElementNode:
+    box = make_box(0, 0, 10, 10)
+    return TreeElementNode(
+        name=name,
+        control_type="ButtonControl",
+        bounding_box=box,
+        center=box.get_center(),
+        window_name="Window",
+        metadata={},
     )
 
 
@@ -787,3 +801,161 @@ class TestProcessExclusion:
 
         assert traversed == [200]
         assert tree_instance.element_budget.count == 1
+
+
+class TestWalkDeadlineStopsTraversal:
+    """A walk must also be bounded in time, not only in element count — see budget.py.
+
+    The element budget cannot bound a slow provider: every node it appends is paid for
+    at whatever price the target's accessibility provider charges, so a capture can sit
+    well inside its 500-element budget and still run for minutes.
+    """
+
+    def _children_costing(self, tree_instance, clock, seconds_per_child, count=5):
+        """Wire `count` button children whose property reads cost `seconds_per_child`."""
+        parent = _make_pane_parent()
+        children = [_make_button_child(f"btn{i}", 10 * i) for i in range(count)]
+
+        def fake_get_children(node, cache_request):
+            if node is parent:
+                clock.advance(seconds_per_child)
+                return children
+            clock.advance(seconds_per_child)
+            return []
+
+        return parent, fake_get_children
+
+    def test_slow_walk_is_cut_at_the_deadline_and_keeps_what_it_collected(
+        self, tree_instance, monkeypatch
+    ):
+        clock = FakeClock()
+        parent, fake_get_children = self._children_costing(tree_instance, clock, 1.0)
+        monkeypatch.setattr(
+            "windows_mcp.tree.service.CachedControlHelper.get_cached_children",
+            fake_get_children,
+        )
+        monkeypatch.setattr("windows_mcp.tree.service.AccessibleRoleNames", {43: "PushButton"})
+
+        tree_instance.element_budget = TreeElementBudget(limit=500)
+        tree_instance.walk_deadline = TreeWalkDeadline(limit_sec=3.0, clock=clock)
+
+        interactive_nodes = []
+        tree_instance.tree_traversal(
+            parent,
+            Rect(0, 0, 500, 500),
+            "Window",
+            False,
+            interactive_nodes,
+            [],
+            [],
+            [],
+        )
+
+        assert tree_instance.walk_deadline.expired is True
+        # Partial, not empty: what was collected before the deadline is kept.
+        assert 0 < len(interactive_nodes) < 5
+        # The element budget is untouched — this cut was about time, not size.
+        assert tree_instance.element_budget.truncated is False
+
+    def test_nothing_changes_when_the_deadline_is_not_reached(self, tree_instance, monkeypatch):
+        clock = FakeClock()
+        parent, fake_get_children = self._children_costing(tree_instance, clock, 0.01)
+        monkeypatch.setattr(
+            "windows_mcp.tree.service.CachedControlHelper.get_cached_children",
+            fake_get_children,
+        )
+        monkeypatch.setattr("windows_mcp.tree.service.AccessibleRoleNames", {43: "PushButton"})
+
+        tree_instance.element_budget = TreeElementBudget(limit=500)
+        tree_instance.walk_deadline = TreeWalkDeadline(limit_sec=10.0, clock=clock)
+
+        interactive_nodes = []
+        tree_instance.tree_traversal(
+            parent,
+            Rect(0, 0, 500, 500),
+            "Window",
+            False,
+            interactive_nodes,
+            [],
+            [],
+            [],
+        )
+
+        assert len(interactive_nodes) == 5
+        assert tree_instance.walk_deadline.expired is False
+        assert tree_instance._truncation_reason() == ""
+
+    def test_expired_deadline_skips_remaining_windows(self, tree_instance, monkeypatch):
+        """The window loop stops too, so one slow window cannot drag the rest in."""
+        clock = FakeClock()
+        walked = []
+
+        def fake_get_nodes(handle, is_browser, wait_time=0, use_dom=False):
+            walked.append(handle)
+            clock.advance(6.0)
+            return [], [], [], None
+
+        monkeypatch.setattr(tree_instance, "get_nodes", fake_get_nodes)
+        monkeypatch.setattr("windows_mcp.tree.service.ControlFromHandle", lambda handle: MagicMock())
+        tree_instance.walk_deadline = TreeWalkDeadline(limit_sec=5.0, clock=clock)
+
+        tree_instance.get_window_wise_nodes(
+            windows_handles=[11, 22, 33], active_window_flag=True
+        )
+
+        assert walked == [11]
+
+
+class TestTruncationReason:
+    """`truncated` tells a client the tree is partial; the reason tells it which knob."""
+
+    def test_no_reason_when_complete(self, tree_instance):
+        tree_instance.element_budget = TreeElementBudget(limit=10)
+        tree_instance.walk_deadline = TreeWalkDeadline(limit_sec=10.0, clock=FakeClock())
+        assert tree_instance._truncation_reason() == ""
+
+    def test_elements_reason(self, tree_instance):
+        tree_instance.element_budget = TreeElementBudget(limit=1)
+        tree_instance.element_budget.try_consume(5)
+        tree_instance.walk_deadline = TreeWalkDeadline(limit_sec=10.0, clock=FakeClock())
+        assert tree_instance._truncation_reason() == "elements"
+
+    def test_time_reason(self, tree_instance):
+        clock = FakeClock()
+        tree_instance.element_budget = TreeElementBudget(limit=10)
+        tree_instance.walk_deadline = TreeWalkDeadline(limit_sec=1.0, clock=clock)
+        clock.advance(2.0)
+        assert tree_instance._truncation_reason() == "time"
+
+    def test_both_reasons(self, tree_instance):
+        clock = FakeClock()
+        tree_instance.element_budget = TreeElementBudget(limit=1)
+        tree_instance.element_budget.try_consume(5)
+        tree_instance.walk_deadline = TreeWalkDeadline(limit_sec=1.0, clock=clock)
+        clock.advance(2.0)
+        assert tree_instance._truncation_reason() == "elements+time"
+
+    def test_get_state_reports_a_time_truncated_capture(self, tree_instance, monkeypatch):
+        """End to end on the state the tools serialize: partial, truncated, reason=time."""
+        clock = FakeClock()
+
+        node = _make_tree_element_node("btn")
+
+        def fake_window_wise_nodes(windows_handles, active_window_flag, use_dom=False):
+            clock.advance(12.0)
+            return [node], [], [], [], []
+
+        monkeypatch.setattr(tree_instance, "get_window_wise_nodes", fake_window_wise_nodes)
+        monkeypatch.setattr(
+            "windows_mcp.tree.service.resolve_tree_timeout", lambda: 10.0
+        )
+        monkeypatch.setattr("windows_mcp.tree.service.TreeWalkDeadline",
+                            lambda limit_sec: TreeWalkDeadline(limit_sec, clock=clock))
+
+        state = tree_instance.get_state(active_window_handle=42, other_windows_handles=[])
+
+        assert state.truncated is True
+        assert state.truncation_reason == "time"
+        assert state.timeout_sec == 10.0
+        assert "10s capture time limit" in state.interactive_elements_to_string()
+        assert "WINDOWS_MCP_TREE_TIMEOUT" in state.interactive_elements_to_string()

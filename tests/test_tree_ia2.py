@@ -8,6 +8,9 @@ integration testing.
 from unittest.mock import MagicMock
 
 from windows_mcp.tree import ia2
+from windows_mcp.tree.budget import TreeWalkDeadline
+
+from tests.test_tree_budget import FakeClock
 from windows_mcp.tree.views import BoundingBox, TextElementNode, TreeElementNode
 
 
@@ -412,3 +415,66 @@ def test_traverse_window_returns_empty_when_runtime_error(monkeypatch):
     assert result.dom_bounding_box is None
     assert result.informative_nodes == []
     assert result.interactive_nodes == []
+
+
+class TestWalkerDeadline:
+    """The IA2 walk had size caps but no clock — a slow provider could run forever."""
+
+    def _clip(self):
+        return BoundingBox(left=0, top=0, right=1000, bottom=1000, width=1000, height=1000)
+
+    def test_walk_stops_descending_once_the_deadline_expires(self, monkeypatch):
+        clock = FakeClock()
+        deadline = TreeWalkDeadline(limit_sec=3.0, clock=clock)
+        walker = ia2._Walker(window_name="Firefox", dom_clip=self._clip(), deadline=deadline)
+
+        def slow_children(iacc, iface):
+            clock.advance(1.0)
+            return [MagicMock() for _ in range(3)]
+
+        monkeypatch.setattr(ia2, "_iter_children", slow_children)
+        monkeypatch.setattr(ia2, "_acc_role", lambda _: ia2.ROLE_DOCUMENT)
+        monkeypatch.setattr(ia2, "_acc_state", lambda _: 0)
+        monkeypatch.setattr(ia2, "_acc_location", lambda _: (0, 0, 100, 100))
+        monkeypatch.setattr(ia2, "_acc_name", lambda _: "node")
+
+        walker.walk(MagicMock(), MagicMock())
+
+        assert walker.timed_out is True
+        # It walked something and then stopped — far short of the 3-per-node fan-out.
+        assert 0 < walker.seen < 13
+
+    def test_walk_without_a_deadline_is_unbounded_in_time(self, monkeypatch):
+        walker = ia2._Walker(window_name="Firefox", dom_clip=self._clip())
+        monkeypatch.setattr(ia2, "_iter_children", lambda iacc, iface: [])
+        monkeypatch.setattr(ia2, "_acc_role", lambda _: ia2.ROLE_DOCUMENT)
+        monkeypatch.setattr(ia2, "_acc_state", lambda _: 0)
+        monkeypatch.setattr(ia2, "_acc_location", lambda _: (0, 0, 100, 100))
+        monkeypatch.setattr(ia2, "_acc_name", lambda _: "node")
+
+        walker.walk(MagicMock(), MagicMock())
+
+        assert walker.timed_out is False
+        assert walker.seen == 1
+
+    def test_unexpired_deadline_does_not_change_the_walk(self, monkeypatch):
+        clock = FakeClock()
+        deadline = TreeWalkDeadline(limit_sec=100.0, clock=clock)
+        walker = ia2._Walker(window_name="Firefox", dom_clip=self._clip(), deadline=deadline)
+
+        children = {0: [MagicMock(), MagicMock()]}
+
+        def children_once(iacc, iface):
+            clock.advance(0.1)
+            return children.pop(0, [])
+
+        monkeypatch.setattr(ia2, "_iter_children", children_once)
+        monkeypatch.setattr(ia2, "_acc_role", lambda _: ia2.ROLE_DOCUMENT)
+        monkeypatch.setattr(ia2, "_acc_state", lambda _: 0)
+        monkeypatch.setattr(ia2, "_acc_location", lambda _: (0, 0, 100, 100))
+        monkeypatch.setattr(ia2, "_acc_name", lambda _: "node")
+
+        walker.walk(MagicMock(), MagicMock())
+
+        assert walker.timed_out is False
+        assert walker.seen == 3

@@ -21,6 +21,7 @@ from typing import Optional
 
 from _ctypes import COMError
 
+from windows_mcp.tree.budget import TreeWalkDeadline
 from windows_mcp.tree.views import BoundingBox, TextElementNode, TreeElementNode
 
 logger = logging.getLogger(__name__)
@@ -319,17 +320,31 @@ class _Walker:
        ``traverse_window`` as the DOM bounding box.
     """
 
-    def __init__(self, window_name: str, dom_clip: Optional[BoundingBox]):
+    def __init__(
+        self,
+        window_name: str,
+        dom_clip: Optional[BoundingBox],
+        deadline: Optional[TreeWalkDeadline] = None,
+    ):
         self.window_name = window_name
         self.dom_clip = dom_clip
+        self.deadline = deadline
         self.informative: list[TextElementNode] = []
         self.interactive: list[TreeElementNode] = []
         self.seen = 0
         self.in_document = 0  # depth of nested documents (iframes etc.)
         self.active_document_box: Optional[BoundingBox] = None
 
+    @property
+    def timed_out(self) -> bool:
+        """Whether the capture this walk belongs to has run out of wall-clock budget."""
+        return self.deadline is not None and self.deadline.expired
+
     def walk(self, iacc, iface, depth: int = 0) -> None:
-        if depth > MAX_DEPTH or self.seen >= MAX_NODES:
+        # The size caps bound how big the result gets; the deadline bounds how long
+        # getting there may take, which a node count cannot — the per-node cost belongs
+        # to the target's accessibility provider, not to us.
+        if depth > MAX_DEPTH or self.seen >= MAX_NODES or self.timed_out:
             return
         self.seen += 1
 
@@ -452,6 +467,7 @@ def traverse_window(
     hwnd: int,
     window_name: str,
     window_bounding_box: Optional[BoundingBox] = None,
+    deadline: Optional[TreeWalkDeadline] = None,
 ) -> IA2TraversalResult:
     """Walk the IAccessible tree of ``hwnd`` and return DOM-shaped node lists.
 
@@ -465,6 +481,9 @@ def traverse_window(
         window_bounding_box: Outer window rectangle. Used to clip element
             rectangles to the visible area, matching what the UIA path does
             via :py:meth:`Tree.iou_bounding_box`. ``None`` disables clipping.
+        deadline: Wall-clock budget shared with the calling capture. The walk
+            stops descending once it expires and returns what it collected so
+            far. ``None`` leaves the walk bounded only by the size caps.
 
     Returns:
         :class:`IA2TraversalResult` containing the (possibly empty)
@@ -482,7 +501,7 @@ def traverse_window(
         logger.warning("IA2 acquisition failed for hwnd %#x: %s", hwnd, e)
         return IA2TraversalResult(window_bounding_box, [], [])
 
-    walker = _Walker(window_name=window_name, dom_clip=window_bounding_box)
+    walker = _Walker(window_name=window_name, dom_clip=window_bounding_box, deadline=deadline)
     try:
         walker.walk(root, iface)
     except COMError as e:
@@ -493,6 +512,12 @@ def traverse_window(
             "IA2 walk for '%s' hit MAX_NODES=%d cap; output is truncated",
             window_name,
             MAX_NODES,
+        )
+    if walker.timed_out:
+        logger.warning(
+            "IA2 walk for '%s' stopped at the %.1fs capture deadline; output is truncated",
+            window_name,
+            deadline.limit_sec,
         )
 
     # Prefer the active document's bbox (the web content area) over the window bbox.
