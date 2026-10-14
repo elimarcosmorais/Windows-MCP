@@ -33,6 +33,10 @@ DEFAULT_TREE_TIMEOUT_SEC = 10.0
 TRUNCATION_REASON_ELEMENTS = "elements"
 TRUNCATION_REASON_TIME = "time"
 TRUNCATION_REASON_BOTH = "elements+time"
+#: The capture never came back and was abandoned mid-call — see `tree.worker`. Distinct
+#: from the reasons above: those describe a walk that stopped itself and still has nodes
+#: to show, this one describes a capture whose result was never obtained.
+TRUNCATION_REASON_ABANDONED = "abandoned"
 
 
 def resolve_max_tree_elements(env: "os._Environ[str] | dict[str, str] | None" = None) -> int:

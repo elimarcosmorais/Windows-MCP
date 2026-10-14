@@ -3,7 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from windows_mcp.tree.budget import TRUNCATION_REASON_BOTH, TRUNCATION_REASON_TIME
+from windows_mcp.tree.budget import (
+    TRUNCATION_REASON_ABANDONED,
+    TRUNCATION_REASON_BOTH,
+    TRUNCATION_REASON_TIME,
+)
 
 
 _ACTION_MAP: dict[str, str] = {
@@ -103,8 +107,8 @@ def _truncation_note(
 
     Args:
         element_limit: Element budget the capture ran under.
-        truncation_reason: ``"time"``, ``"elements+time"``, or anything else for
-            the element-limit wording (the default, so a state built without a
+        truncation_reason: ``"time"``, ``"elements+time"``, ``"abandoned"``, or anything
+            else for the element-limit wording (the default, so a state built without a
             reason keeps the original note).
         timeout_sec: Wall-clock budget the capture ran under, in seconds.
 
@@ -113,6 +117,16 @@ def _truncation_note(
     """
     elements = f"reached the {element_limit}-element capture limit"
     timing = f"hit the {timeout_sec:g}s capture time limit"
+    if truncation_reason == TRUNCATION_REASON_ABANDONED:
+        # Nothing was captured, so the "narrow the view" hint would be misleading: the
+        # target stopped answering UI Automation altogether. Point at the one setting
+        # that keeps the walk out of that provider instead.
+        return (
+            f"... [truncated: no elements captured — the target application stopped "
+            f"answering UI Automation and the capture was abandoned after {timeout_sec:g}s. "
+            "Retry, or keep the walk out of that process with "
+            "WINDOWS_MCP_EXCLUDE_PROCESSES.]"
+        )
     if truncation_reason == TRUNCATION_REASON_BOTH:
         return (
             f"... [truncated: {elements} and {timing} — {_NARROW_HINT}"
@@ -221,9 +235,21 @@ class TreeState:
     def _truncation_note(self) -> str:
         return _truncation_note(self.element_limit, self.truncation_reason, self.timeout_sec)
 
+    def _empty_render(self, message: str) -> str:
+        """Render an empty capture, saying so when the emptiness is not the truth.
+
+        An abandoned capture has no nodes because it never came back, not because the
+        window has nothing in it, and "No interactive elements" alone reads as the
+        latter. The element and time limits keep their existing rendering: a capture
+        they stopped has already collected what it found.
+        """
+        if self.truncation_reason == TRUNCATION_REASON_ABANDONED:
+            return message + "\n\n" + self._truncation_note()
+        return message
+
     def semantic_tree_to_string(self) -> str:
         if not self.semantic_tree_root:
-            return "No elements"
+            return self._empty_render("No elements")
         lines: list[str] = []
         _render_semantic_node(self.semantic_tree_root, lines, "", is_last=True)
         text = "\n".join(lines)
@@ -233,7 +259,7 @@ class TreeState:
 
     def interactive_elements_to_string(self) -> str:
         if not self.interactive_nodes:
-            return "No interactive elements"
+            return self._empty_render("No interactive elements")
         text = _render_tree(self.interactive_nodes, _node_meta_str)
         if self.truncated:
             text += "\n\n" + self._truncation_note()
@@ -241,7 +267,7 @@ class TreeState:
 
     def scrollable_elements_to_string(self) -> str:
         if not self.scrollable_nodes:
-            return "No scrollable elements"
+            return self._empty_render("No scrollable elements")
         text = _render_tree(self.scrollable_nodes, _scroll_meta_str)
         if self.truncated:
             text += "\n\n" + self._truncation_note()

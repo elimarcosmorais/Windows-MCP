@@ -8,6 +8,7 @@ from windows_mcp.tree.cache_utils import (
     is_uia_dead_element_error,
 )
 from windows_mcp.tree.budget import (
+    TRUNCATION_REASON_ABANDONED,
     TRUNCATION_REASON_BOTH,
     TRUNCATION_REASON_ELEMENTS,
     TRUNCATION_REASON_TIME,
@@ -16,6 +17,7 @@ from windows_mcp.tree.budget import (
     resolve_max_tree_elements,
     resolve_tree_timeout,
 )
+from windows_mcp.tree.worker import resolve_capture_timeout, run_capture
 from windows_mcp.tree.utils import random_point_within_bounding_box
 from windows_mcp.tree import ia2 as ia2_traversal
 from typing import TYPE_CHECKING,Optional,Any
@@ -120,6 +122,47 @@ class Tree:
 
 
     def get_state(self,active_window_handle:int|None,other_windows_handles:list[int],use_dom:bool=False)->TreeState:
+        """Capture the tree, bounded in wall time even when a COM call never returns.
+
+        TreeWalkDeadline stops a slow walk between UI Automation calls. A provider that
+        wedges inside a single call cannot be stopped there — measured against VS Code,
+        a capture asked for a 3.0s deadline returned at 20.4s — so the capture runs on a
+        worker thread with its own COM apartment and this call stops waiting for it.
+
+        Args:
+            active_window_handle: Handle of the foreground window, or None.
+            other_windows_handles: Handles of the background windows to include.
+            use_dom: Whether to extract the DOM of a browser window.
+
+        Returns:
+            The captured TreeState, or an empty one marked truncated with reason
+            ``"abandoned"`` when the capture had to be given up on.
+        """
+        walk_timeout=resolve_tree_timeout()
+        capture_timeout=resolve_capture_timeout(walk_timeout)
+        state,abandoned=run_capture(
+            lambda:self._capture_state(active_window_handle,other_windows_handles,use_dom=use_dom),
+            capture_timeout,
+        )
+        if abandoned:
+            element_limit=resolve_max_tree_elements()
+            logger.warning(
+                "[Tree] Capture abandoned after %.1fs (walk limit=%.1fs) — the target stopped "
+                "answering UI Automation. The capture thread is left running and is not reused.",
+                capture_timeout,
+                walk_timeout,
+            )
+            return TreeState(
+                status=False,
+                truncated=True,
+                truncation_reason=TRUNCATION_REASON_ABANDONED,
+                timeout_sec=capture_timeout,
+                element_limit=element_limit,
+                capture_sec=capture_timeout,
+            )
+        return state
+
+    def _capture_state(self,active_window_handle:int|None,other_windows_handles:list[int],use_dom:bool=False)->TreeState:
         # Reset DOM state to prevent leaks and stale data
         self.dom = None
         self.dom_bounding_box = None
